@@ -8,7 +8,9 @@
     "alarms"
   ],
   "host_permissions": [
-    "https://raw.githubusercontent.com/*"
+    "https://raw.githubusercontent.com/*",
+    "https://scholar.google.com/*",
+    "https://scholar.google.de/*"
   ],
   "background": {
     "service_worker": "background.js"

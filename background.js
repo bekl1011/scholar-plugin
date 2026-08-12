@@ -5,6 +5,20 @@ const DATA_SOURCES = {
 };
 
 const UPDATE_INTERVAL_MINUTES = 10080; // 7 Tage
+const UPDATE_ALARM_NAME = "updateRankings";
+
+async function ensureUpdateAlarm() {
+    const existingAlarm = await chrome.alarms.get(UPDATE_ALARM_NAME);
+    if (!existingAlarm) {
+        await chrome.alarms.create(UPDATE_ALARM_NAME, {
+            periodInMinutes: UPDATE_INTERVAL_MINUTES
+        });
+    }
+}
+
+function reportAlarmError(error) {
+    console.error("[Scholar Venue Ranker] Update-Alarm konnte nicht angelegt werden:", error);
+}
 
 async function fetchAndCacheRankings() {
     try {
@@ -35,12 +49,16 @@ async function fetchAndCacheRankings() {
 
 chrome.runtime.onInstalled.addListener(() => {
     fetchAndCacheRankings();
-    chrome.alarms.create("updateRankings", { periodInMinutes: UPDATE_INTERVAL_MINUTES });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === "updateRankings") fetchAndCacheRankings();
+    if (alarm.name === UPDATE_ALARM_NAME) fetchAndCacheRankings();
 });
+
+// MV3-Service-Worker werden regelmäßig beendet und neu gestartet. Dabei kann
+// ein Alarm je nach Browser/Version fehlen, obwohl die Extension installiert
+// bleibt. Die Prüfung bei jeder Worker-Initialisierung ist idempotent.
+ensureUpdateAlarm().catch(reportAlarmError);
 
 // content.js fragt dies ab, falls der Storage beim Laden noch leer ist.
 // In älteren Versionen gab es dafür keinen Listener; v12 macht diesen

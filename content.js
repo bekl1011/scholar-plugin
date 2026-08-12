@@ -2,10 +2,12 @@
     "use strict";
 
     const SHOW_NOT_FOUND = false;
-    const DEBUG = true;
+    const DEBUG = false;
 
-    const CITE_CACHE_PREFIX = "scholarCite:v13-debug:";
+    const CITE_CACHE_ROOT_PREFIX = "scholarCite:";
+    const CITE_CACHE_PREFIX = `${CITE_CACHE_ROOT_PREFIX}v13-debug:`;
     const CITE_CACHE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+    const MAX_CITE_CACHE_ENTRIES = 500;
     const CITE_FETCH_TIMEOUT_MS = 6500;
     const CITE_DELAY_MS = 350;
     const MAX_CITE_LOOKUPS_PER_PAGE = 12;
@@ -93,6 +95,7 @@
 
     let citeLookupsThisPage = 0;
     let citeLookupBlocked = false;
+    let citeCacheMaintenancePromise = null;
 
     console.info("[Scholar Venue Ranker] v13.2-debug geladen – Organisationskürzel werden nicht mehr als eigenständige Venue-Akronyme gewertet.");
 
@@ -367,9 +370,13 @@
             if (containsWordPhrase(normalizedVenue, signal)) return signal;
         }
 
-        const normalizedTitle = normalize(title);
-        const prefix = normalizedTitle.match(/^(poster|demo|demonstration|tutorial|workshop)\b/);
-        return prefix ? prefix[1] : null;
+        // Der Titel allein ist nur dann belastbar, wenn Scholar ihn sichtbar als
+        // Beitragstyp labelt (z.B. "Demo: ..." oder "[Poster] ..."). Normale
+        // Paper wie "Demonstration of ..." dürfen nicht herausgefiltert werden.
+        const titleLabel = String(title || "").match(
+            /^\s*\[?(poster|demo|demonstration|tutorial|workshop)\]?\s*(?::|[–—-])\s+/i
+        );
+        return titleLabel ? normalize(titleLabel[1]) : null;
     }
 
     function inferTypeFromText(value) {
@@ -954,12 +961,59 @@
         return null;
     }
 
+    async function maintainCitationCache() {
+        const stored = await chrome.storage.local.get(null);
+        const now = Date.now();
+        const entries = Object.entries(stored)
+            .filter(([key]) => key.startsWith(CITE_CACHE_ROOT_PREFIX))
+            .map(([key, value]) => ({
+                key,
+                resolvedAt: Number(value?.resolvedAt) || 0
+            }))
+            .sort((a, b) => b.resolvedAt - a.resolvedAt);
+
+        const keysToRemove = entries
+            .filter((entry, index) =>
+                !entry.resolvedAt ||
+                now - entry.resolvedAt >= CITE_CACHE_TTL_MS ||
+                index >= MAX_CITE_CACHE_ENTRIES
+            )
+            .map(entry => entry.key);
+
+        if (keysToRemove.length) {
+            await chrome.storage.local.remove(keysToRemove);
+        }
+    }
+
+    async function ensureCitationCacheMaintained() {
+        if (!citeCacheMaintenancePromise) {
+            citeCacheMaintenancePromise = maintainCitationCache().catch(error => {
+                if (DEBUG) {
+                    console.debug("[Scholar Venue Ranker] Cite-Cache-Bereinigung fehlgeschlagen:", error);
+                }
+            });
+        }
+        await citeCacheMaintenancePromise;
+    }
+
     async function cacheCitation(cid, title, year, result) {
-        const identity = citationIdentity(cid, title, year);
-        const key = `${CITE_CACHE_PREFIX}${hashString(identity)}`;
-        await chrome.storage.local.set({
-            [key]: { identity, resolvedAt: Date.now(), result }
-        });
+        try {
+            await ensureCitationCacheMaintained();
+
+            const identity = citationIdentity(cid, title, year);
+            const key = `${CITE_CACHE_PREFIX}${hashString(identity)}`;
+            await chrome.storage.local.set({
+                [key]: { identity, resolvedAt: Date.now(), result }
+            });
+            return true;
+        } catch (error) {
+            // Der Cache ist eine Optimierung. Quoten-/Storage-Fehler dürfen eine
+            // bereits erfolgreiche Venue-Auflösung niemals verwerfen.
+            if (DEBUG) {
+                console.debug("[Scholar Venue Ranker] Cite-Ergebnis konnte nicht gecacht werden:", error);
+            }
+            return false;
+        }
     }
 
     function buildScholarCiteUrl(cid) {
@@ -1364,5 +1418,15 @@
         for (const pub of publications) {
             await processPublication(pub, rankings);
         }
+    }
+
+    // Kleine, explizit aktivierte Testoberfläche; im Content Script bleibt sie
+    // standardmäßig vollständig inaktiv.
+    if (globalThis.__SVR_ENABLE_TEST_HOOKS__) {
+        globalThis.__SVR_TEST_HOOKS__ = {
+            detectSubvenue,
+            cacheCitation,
+            maintainCitationCache
+        };
     }
 })();

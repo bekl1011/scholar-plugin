@@ -1,0 +1,7 @@
+{
+  "name": "scholar-venue-ranker",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}
