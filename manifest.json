@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Scholar Venue Ranker",
+  "version": "1.2",
+  "description": "Zeigt Konferenz- und Journal-Rankings für Computer-Science-Paper in Google Scholar an.",
+  "permissions": [
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://raw.githubusercontent.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://scholar.google.com/*", "*://scholar.google.de/*"],
+      "js": ["content.js"]
+    }
+  ]
+}
