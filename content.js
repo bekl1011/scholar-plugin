@@ -2,10 +2,10 @@
     "use strict";
 
     const SHOW_NOT_FOUND = false;
-    const DEBUG = true;
+    const DEBUG = false;
 
     const CITE_CACHE_ROOT_PREFIX = "scholarCite:";
-    const CITE_CACHE_PREFIX = "scholarCite:v13-debug:";
+    const CITE_CACHE_PREFIX = "scholarCite:v14:";
     const CITE_CACHE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
     const MAX_CITE_CACHE_ENTRIES = 500;
     const CITE_FETCH_TIMEOUT_MS = 6500;
