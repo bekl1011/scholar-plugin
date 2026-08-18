@@ -2,15 +2,48 @@
     "use strict";
 
     const SHOW_NOT_FOUND = false;
-    const DEBUG = false;
+    const DEBUG = true;
 
     const CITE_CACHE_ROOT_PREFIX = "scholarCite:";
-    const CITE_CACHE_PREFIX = `${CITE_CACHE_ROOT_PREFIX}v13-debug:`;
+    const CITE_CACHE_PREFIX = "scholarCite:v13-debug:";
     const CITE_CACHE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
     const MAX_CITE_CACHE_ENTRIES = 500;
     const CITE_FETCH_TIMEOUT_MS = 6500;
-    const CITE_DELAY_MS = 350;
-    const MAX_CITE_LOOKUPS_PER_PAGE = 12;
+    const CITE_DELAY_MS = 4000;
+    const CITE_DWELL_MS = 1500;
+    const MAX_CITE_LOOKUPS_PER_PAGE = 2;
+
+    const METADATA_CACHE_PREFIX = "scholarMetadata:v14:";
+    const METADATA_MISS_PREFIX = "scholarMetadataMiss:v14:";
+    const METADATA_CACHE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+    const METADATA_MISS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+    const MAX_METADATA_CACHE_ENTRIES = 1000;
+    const RESULT_WORKER_COUNT = 3;
+    const EXTERNAL_RESOLVER_ORDER = Object.freeze(["dblp", "crossref"]);
+
+    const BADGE_COLORS = Object.freeze({
+        CORE: Object.freeze({
+            "A*": Object.freeze({ background: "#2D6A4F", text: "#FFFFFF" }),
+            A: Object.freeze({ background: "#B7E4C7", text: "#12351F" }),
+            B: Object.freeze({ background: "#F4D35E", text: "#3B2F00" }),
+            C: Object.freeze({ background: "#B23A48", text: "#FFFFFF" })
+        }),
+        CCF: Object.freeze({
+            A: Object.freeze({ background: "#0057B8", text: "#FFFFFF" }),
+            B: Object.freeze({ background: "#5AA6E0", text: "#0B2239" }),
+            C: Object.freeze({ background: "#B9DCF5", text: "#12324A" })
+            }),
+            SJR: Object.freeze({
+            Q1: Object.freeze({ background: "#5B148C", text: "#FFFFFF" }),
+            Q2: Object.freeze({ background: "#9146B8", text: "#FFFFFF" }),
+            Q3: Object.freeze({ background: "#C68AD9", text: "#2B1833" }),
+            Q4: Object.freeze({ background: "#E4D8E8", text: "#3A2C40" })
+        })
+    });
+    const NEUTRAL_BADGE_COLOR = Object.freeze({
+        background: "#E5E7EB",
+        text: "#374151"
+    });
 
     const SUBVENUE_SIGNALS = [
         "workshop", "workshops", "phd forum", "ph d forum",
@@ -95,9 +128,37 @@
 
     let citeLookupsThisPage = 0;
     let citeLookupBlocked = false;
-    let citeCacheMaintenancePromise = null;
+    let localCacheMaintenancePromise = null;
+    let citeQueueTail = Promise.resolve();
+    let citeObserver = null;
+    let profileObserver = null;
+    const citeContexts = new WeakMap();
+    const profileContexts = new WeakMap();
+    const countedResolverRequests = new Set();
 
-    console.info("[Scholar Venue Ranker] v13.2-debug geladen – Organisationskürzel werden nicht mehr als eigenständige Venue-Akronyme gewertet.");
+    const debugStats = {
+        visibleResolutions: 0,
+        metadataCacheHits: 0,
+        dblpRequests: 0,
+        dblpResolutions: 0,
+        crossrefRequests: 0,
+        crossrefResolutions: 0,
+        citeRequests: 0,
+        citeResolutions: 0,
+        profileRowsDetected: 0,
+        profileRowsObserved: 0,
+        profileExternalResolutions: 0,
+        profileCiteRequests: 0
+    };
+
+    if (DEBUG) {
+        console.info("[Scholar Venue Ranker] v14-debug geladen – DBLP/Crossref vor lazy Scholar Cite.");
+    }
+
+    if (DEBUG) {
+        globalThis.__SVR_DEBUG_STATS__ = debugStats;
+        globalThis.__SVR_GET_DEBUG_STATS__ = () => ({ ...debugStats });
+    }
 
     init().catch(error => {
         console.error("[Scholar Venue Ranker] Initialisierung fehlgeschlagen:", error);
@@ -121,7 +182,9 @@
         }
 
         const rankings = prepareRankings(stored);
-        await processResults(rankings);
+        const pageType = detectPageType();
+        await processResults(rankings, pageType);
+        observeDynamicResults(rankings, pageType);
     }
 
     function hasRankingData(stored) {
@@ -344,6 +407,11 @@
         const lastSep = text.lastIndexOf(" - ");
         if (firstSep < 0) return null;
 
+        const authors = text.slice(0, firstSep)
+            .split(",")
+            .map(author => author.replace(/\u2026|\.\.\./g, " ").trim())
+            .filter(Boolean);
+
         const rawVenue = (lastSep > firstSep
             ? text.slice(firstSep + 3, lastSep)
             : text.slice(firstSep + 3)).trim();
@@ -360,8 +428,92 @@
             rawVenue,
             venue,
             year,
+            authors,
             truncated: /\u2026|\.\.\./.test(rawVenue)
         };
+    }
+
+    function detectPageType() {
+        const pathname = String(window.location?.pathname || "");
+        const search = String(window.location?.search || "");
+        const profileUrl = pathname.endsWith("/citations") && new URLSearchParams(search).has("user");
+        const profileDom = Boolean(document.querySelector?.("#gsc_a_b, #gsc_a_t"));
+        return profileUrl || profileDom ? "profile" : "search";
+    }
+
+    function publicationSelector(pageType) {
+        return pageType === "profile"
+            ? "#gsc_a_b .gsc_a_tr, #gsc_a_t .gsc_a_tr"
+            : ".gs_r.gs_or.gs_scl";
+    }
+
+    function extractSearchPaper(row) {
+        const titleElement = row.querySelector(".gs_rt");
+        const metaElement = row.querySelector(".gs_a");
+        if (!titleElement || !metaElement) return null;
+
+        const title = cleanTitle(titleElement.textContent);
+        const meta = extractMeta(metaElement.textContent);
+        if (!title || !meta?.venue) return null;
+
+        return {
+            row,
+            pageType: "search",
+            titleElement,
+            badgePlacement: "append",
+            title,
+            meta
+        };
+    }
+
+    function extractProfilePaper(row) {
+        const titleElement = row.querySelector(".gsc_a_at");
+        if (!titleElement) return null;
+
+        const title = cleanTitle(titleElement.textContent);
+        if (!title) return null;
+
+        const detailsCell = row.querySelector(".gsc_a_t") || titleElement.parentElement;
+        const grayLines = detailsCell
+            ? [...detailsCell.querySelectorAll(".gs_gray")]
+                .map(element => String(element.textContent || "").replace(/\s+/g, " ").trim())
+            : [];
+        const authors = String(grayLines[0] || "")
+            .split(",")
+            .map(author => author.replace(/\u2026|\.\.\./g, " ").trim())
+            .filter(Boolean);
+        const rawVenue = String(grayLines[1] || "").trim();
+        const yearText = String(
+            row.querySelector(".gsc_a_y .gsc_a_h, .gsc_a_y span")?.textContent || ""
+        );
+        const years = [...`${rawVenue} ${yearText}`.matchAll(/\b(?:19|20)\d{2}\b/g)]
+            .map(match => Number(match[0]));
+        const year = years.length ? years[years.length - 1] : null;
+        const venue = rawVenue
+            .replace(/(?:,\s*|\s+)\b(?:19|20)\d{2}\b\s*$/, "")
+            .replace(/^[\s.…-]+|[\s.…-]+$/g, "")
+            .trim();
+
+        return {
+            row,
+            pageType: "profile",
+            titleElement,
+            badgePlacement: "after-title",
+            title,
+            meta: {
+                rawVenue,
+                venue,
+                year,
+                authors,
+                truncated: /\u2026|\.\.\./.test(rawVenue)
+            }
+        };
+    }
+
+    function extractPaperMetadata(row, pageType) {
+        return pageType === "profile"
+            ? extractProfilePaper(row)
+            : extractSearchPaper(row);
     }
 
     function detectSubvenue(title, venue) {
@@ -370,9 +522,6 @@
             if (containsWordPhrase(normalizedVenue, signal)) return signal;
         }
 
-        // Der Titel allein ist nur dann belastbar, wenn Scholar ihn sichtbar als
-        // Beitragstyp labelt (z.B. "Demo: ..." oder "[Poster] ..."). Normale
-        // Paper wie "Demonstration of ..." dürfen nicht herausgefiltert werden.
         const titleLabel = String(title || "").match(
             /^\s*\[?(poster|demo|demonstration|tutorial|workshop)\]?\s*(?::|[–—-])\s+/i
         );
@@ -575,6 +724,64 @@
         return null;
     }
 
+    // v13.3: Kurze Venue-Akronyme (3–4 Zeichen) sind allein weiterhin
+    // zu riskant (ITC, DAS, ...). Sie dürfen aber als starke Evidenz gelten,
+    // wenn derselbe Cite-Venue-String ZUSÄTZLICH den spezifischen semantischen
+    // Kern des ausgeschriebenen Katalognamens enthält.
+    //
+    // Positiv:
+    //   "IEEE 58th Vehicular Technology Conference. VTC 2003-Fall ..."
+    //   Katalog: IEEE Vehicular Technology Conference (VTC)
+    //   -> VTC + "vehicular technology" bestätigt dieselbe Venue.
+    //
+    // Negativ:
+    //   "Proc. 16th ITC Specialist Seminar ..."
+    //   Katalog: IEEE International Test Conference (ITC)
+    //   -> "test" ist als Kern zu kurz/generisch und bestätigt ITC nicht.
+    //
+    //   "... ICMLCN"
+    //   Katalog: International Conference on Machine Learning (ICML)
+    //   -> ICML erscheint nicht als eigenständiges Token; kein Match.
+    function shortAcronymWithCoreSupport(item, originalValue) {
+        const abbr = String(item?.abbr || "").trim();
+        if (!abbr) return null;
+
+        const parts = abbreviationParts(abbr);
+        if (parts.length !== 1) return null;
+
+        const compact = normalize(abbr).replace(/[^a-z0-9*+]/g, "");
+        const compactLength = compact.replace(/[^a-z0-9]/g, "").length;
+
+        // Diese Regel ist ausdrücklich nur für die bisherige Lücke bei
+        // 3- bis 4-stelligen Einzelakronymen gedacht.
+        if (compactLength < 3 || compactLength > 4) return null;
+
+        if (GENERIC_ORG_ACRONYMS.has(normalize(parts[0]))) return null;
+
+        const mention = abbreviationMention(originalValue, abbr);
+        if (!mention) return null;
+
+        const catalogCore = String(item?._coreName || "").trim();
+        const coreTokens = catalogCore.split(" ").filter(Boolean);
+
+        // Mindestens zwei echte Inhaltswörter; damit scheitert z.B. ITC
+        // ("International Test Conference" -> Kern "test").
+        if (coreTokens.length < 2 || catalogCore.length < 12) return null;
+
+        const valueCanonical = canonicalVenue(originalValue);
+
+        // Nicht nur Token-Überlappung, sondern der komplette Katalog-Kern muss
+        // als zusammenhängende Wortfolge im Cite-Venue stehen. Das hält die
+        // Regel konservativ und verhindert neue ICML-/DAS-artige Fehlmatches.
+        if (!containsWordPhrase(valueCanonical, catalogCore)) return null;
+
+        return {
+            ...mention,
+            evidence: "short-acronym+core-name",
+            coreName: catalogCore
+        };
+    }
+
     function explicitParentheticalAcronyms(value) {
         const result = new Set();
         const text = String(value || "");
@@ -774,6 +981,21 @@
                 });
             }
 
+            // Tier 2.5a.5 (v13.3): kurzes Akronym + bestätigter
+            // ausgeschriebener Kernname. Das schließt die VTC-Lücke, ohne die
+            // Schutzregeln gegen ITC/DAS/ICMLCN aufzuweichen.
+            const shortAcronymCore = shortAcronymWithCoreSupport(item, value);
+            if (shortAcronymCore) {
+                consider({
+                    item,
+                    score: 1325,
+                    matchedBy: `short-acronym-core:${shortAcronymCore.evidence}`,
+                    venue: value,
+                    origin,
+                    coreName: shortAcronymCore.coreName
+                });
+            }
+
             // Tier 2.5b (v13): exakter langer semantischer Kernname.
             // Beispiel SOSP:
             //   ACM SIGOPS Symposium on Operating Systems Principles
@@ -945,61 +1167,121 @@
             : `${Number(year) || 0}|${normalize(title)}`;
     }
 
-    async function getCachedCitation(cid, title, year) {
-        const identity = citationIdentity(cid, title, year);
-        const key = `${CITE_CACHE_PREFIX}${hashString(identity)}`;
-        const stored = await chrome.storage.local.get(key);
-        const cached = stored[key];
+    function metadataIdentity(title, year) {
+        return `${normalize(title)}|${Number(year) || 0}`;
+    }
 
-        if (
-            cached?.identity === identity &&
-            cached?.resolvedAt &&
-            Date.now() - cached.resolvedAt < CITE_CACHE_TTL_MS
-        ) {
-            return { ...cached.result, source: "scholar-cite-cache" };
+    function metadataCacheKey(title, year) {
+        const identity = metadataIdentity(title, year);
+        return `${METADATA_CACHE_PREFIX}${hashString(identity)}`;
+    }
+
+    function metadataMissKey(resolver, title, year) {
+        const identity = metadataIdentity(title, year);
+        return `${METADATA_MISS_PREFIX}${resolver}:${hashString(identity)}`;
+    }
+
+    async function getCachedCitation(cid, title, year) {
+        try {
+            const identity = citationIdentity(cid, title, year);
+            const key = `${CITE_CACHE_PREFIX}${hashString(identity)}`;
+            const stored = await chrome.storage.local.get(key);
+            const cached = stored[key];
+
+            if (
+                cached?.identity === identity &&
+                cached?.resolvedAt &&
+                Date.now() - cached.resolvedAt < CITE_CACHE_TTL_MS
+            ) {
+                return { ...cached.result, source: "scholar-cite-cache" };
+            }
+        } catch (error) {
+            if (DEBUG) console.debug("[SVR v14] Cite-Cache konnte nicht gelesen werden:", error);
         }
         return null;
     }
 
-    async function maintainCitationCache() {
-        const stored = await chrome.storage.local.get(null);
-        const now = Date.now();
-        const entries = Object.entries(stored)
-            .filter(([key]) => key.startsWith(CITE_CACHE_ROOT_PREFIX))
-            .map(([key, value]) => ({
-                key,
-                resolvedAt: Number(value?.resolvedAt) || 0
-            }))
-            .sort((a, b) => b.resolvedAt - a.resolvedAt);
+    async function getCachedMetadata(title, year) {
+        try {
+            const identity = metadataIdentity(title, year);
+            const key = metadataCacheKey(title, year);
+            const stored = await chrome.storage.local.get(key);
+            const cached = stored[key];
+            if (
+                cached?.identity === identity &&
+                cached?.timestamp &&
+                Date.now() - cached.timestamp < METADATA_CACHE_TTL_MS &&
+                cached?.result?.venue
+            ) {
+                return {
+                    ...cached.result,
+                    metadataSource: cached.result.source,
+                    source: "metadata-cache"
+                };
+            }
+        } catch (error) {
+            if (DEBUG) console.debug("[SVR v14] Metadata-Cache konnte nicht gelesen werden:", error);
+        }
+        return null;
+    }
 
-        const keysToRemove = entries
-            .filter((entry, index) =>
-                !entry.resolvedAt ||
-                now - entry.resolvedAt >= CITE_CACHE_TTL_MS ||
-                index >= MAX_CITE_CACHE_ENTRIES
-            )
-            .map(entry => entry.key);
-
-        if (keysToRemove.length) {
-            await chrome.storage.local.remove(keysToRemove);
+    async function hasCachedResolverMiss(resolver, title, year) {
+        try {
+            const identity = metadataIdentity(title, year);
+            const key = metadataMissKey(resolver, title, year);
+            const stored = await chrome.storage.local.get(key);
+            const cached = stored[key];
+            return Boolean(
+                cached?.identity === identity &&
+                cached?.timestamp &&
+                Date.now() - cached.timestamp < METADATA_MISS_TTL_MS
+            );
+        } catch (error) {
+            if (DEBUG) console.debug(`[SVR v14] ${resolver}-Miss-Cache konnte nicht gelesen werden:`, error);
+            return false;
         }
     }
 
-    async function ensureCitationCacheMaintained() {
-        if (!citeCacheMaintenancePromise) {
-            citeCacheMaintenancePromise = maintainCitationCache().catch(error => {
-                if (DEBUG) {
-                    console.debug("[Scholar Venue Ranker] Cite-Cache-Bereinigung fehlgeschlagen:", error);
-                }
+    async function maintainLocalCaches() {
+        const stored = await chrome.storage.local.get(null);
+        const now = Date.now();
+        const citeEntries = [];
+        const metadataEntries = [];
+        const keysToRemove = [];
+
+        for (const [key, value] of Object.entries(stored)) {
+            const timestamp = Number(value?.resolvedAt ?? value?.timestamp) || 0;
+            if (key.startsWith(CITE_CACHE_ROOT_PREFIX)) {
+                if (!timestamp || now - timestamp >= CITE_CACHE_TTL_MS) keysToRemove.push(key);
+                else citeEntries.push({ key, timestamp });
+            } else if (key.startsWith(METADATA_CACHE_PREFIX)) {
+                if (!timestamp || now - timestamp >= METADATA_CACHE_TTL_MS) keysToRemove.push(key);
+                else metadataEntries.push({ key, timestamp });
+            } else if (key.startsWith(METADATA_MISS_PREFIX)) {
+                if (!timestamp || now - timestamp >= METADATA_MISS_TTL_MS) keysToRemove.push(key);
+            }
+        }
+
+        citeEntries.sort((a, b) => b.timestamp - a.timestamp);
+        metadataEntries.sort((a, b) => b.timestamp - a.timestamp);
+        keysToRemove.push(...citeEntries.slice(MAX_CITE_CACHE_ENTRIES).map(entry => entry.key));
+        keysToRemove.push(...metadataEntries.slice(MAX_METADATA_CACHE_ENTRIES).map(entry => entry.key));
+
+        if (keysToRemove.length) await chrome.storage.local.remove([...new Set(keysToRemove)]);
+    }
+
+    async function ensureLocalCachesMaintained() {
+        if (!localCacheMaintenancePromise) {
+            localCacheMaintenancePromise = maintainLocalCaches().catch(error => {
+                if (DEBUG) console.debug("[SVR v14] Cache-Bereinigung fehlgeschlagen:", error);
             });
         }
-        await citeCacheMaintenancePromise;
+        await localCacheMaintenancePromise;
     }
 
     async function cacheCitation(cid, title, year, result) {
         try {
-            await ensureCitationCacheMaintained();
-
+            await ensureLocalCachesMaintained();
             const identity = citationIdentity(cid, title, year);
             const key = `${CITE_CACHE_PREFIX}${hashString(identity)}`;
             await chrome.storage.local.set({
@@ -1007,12 +1289,43 @@
             });
             return true;
         } catch (error) {
-            // Der Cache ist eine Optimierung. Quoten-/Storage-Fehler dürfen eine
-            // bereits erfolgreiche Venue-Auflösung niemals verwerfen.
-            if (DEBUG) {
-                console.debug("[Scholar Venue Ranker] Cite-Ergebnis konnte nicht gecacht werden:", error);
-            }
+            if (DEBUG) console.debug("[SVR v14] Cite-Ergebnis konnte nicht gecacht werden:", error);
             return false;
+        }
+    }
+
+    async function cacheMetadata(title, year, result) {
+        if (!result?.venue) return false;
+        try {
+            await ensureLocalCachesMaintained();
+            const identity = metadataIdentity(title, year);
+            const key = metadataCacheKey(title, year);
+            await chrome.storage.local.set({
+                [key]: {
+                    identity,
+                    title,
+                    year: Number(year) || null,
+                    timestamp: Date.now(),
+                    result
+                }
+            });
+            return true;
+        } catch (error) {
+            if (DEBUG) console.debug("[SVR v14] Metadata konnte nicht gecacht werden:", error);
+            return false;
+        }
+    }
+
+    async function cacheResolverMiss(resolver, title, year) {
+        try {
+            await ensureLocalCachesMaintained();
+            const identity = metadataIdentity(title, year);
+            const key = metadataMissKey(resolver, title, year);
+            await chrome.storage.local.set({
+                [key]: { identity, timestamp: Date.now() }
+            });
+        } catch (error) {
+            if (DEBUG) console.debug(`[SVR v14] ${resolver}-Miss konnte nicht gecacht werden:`, error);
         }
     }
 
@@ -1177,10 +1490,103 @@
             source,
             typeConfidence: explicitCiteType || explicitVisibleType ? "strong" : "catalog-exact",
             variants: [
-                { value: venue, origin: "cite" },
+                { value: venue, origin: source },
                 { value: visibleVenue, origin: "visible" }
             ].filter(v => v.value)
         };
+    }
+
+    function summarizeAssessments(assessments) {
+        return (Array.isArray(assessments) ? assessments : []).slice(0, 8).map(item => ({
+            title: item?.candidate?.title || null,
+            year: item?.candidate?.year || null,
+            venue: item?.candidate?.venue || null,
+            publicationType: item?.candidate?.publicationType || null,
+            exactTitle: Boolean(item?.exactTitle),
+            yearDistance: item?.yearDistance ?? null,
+            authorOverlap: item?.authorOverlap ?? null,
+            rejection: item?.rejection || null
+        }));
+    }
+
+    function recordExternalRequest(resolver, response) {
+        const requestId = String(response?.requestId || "");
+        if (!requestId || countedResolverRequests.has(requestId)) return;
+        countedResolverRequests.add(requestId);
+        debugStats[`${resolver}Requests`] += 1;
+    }
+
+    function isCacheableResolverMiss(reason) {
+        return [
+            "no-high-confidence-candidate",
+            "ambiguous-candidates",
+            "near-year-not-unique",
+            "venue-or-type-not-safe"
+        ].includes(String(reason || ""));
+    }
+
+    async function resolveViaExternalMetadata(resolver, paper, visibleVenue, rankings, trace) {
+        const cachedMiss = await hasCachedResolverMiss(resolver, paper.title, paper.year);
+        trace[`${resolver}NegativeCacheHit`] = cachedMiss;
+        if (cachedMiss) {
+            if (DEBUG) console.debug(`[SVR v14] ${resolver}: negativer Cache-Treffer`, paper);
+            return null;
+        }
+
+        trace[`${resolver}LookupStarted`] = true;
+        let response;
+        try {
+            response = await chrome.runtime.sendMessage({
+                action: "resolveMetadata",
+                resolver,
+                paper
+            });
+        } catch (error) {
+            response = { resolved: false, source: resolver, reason: String(error?.message || error) };
+        }
+
+        recordExternalRequest(resolver, response);
+        trace[`${resolver}Result`] = {
+            resolved: Boolean(response?.resolved),
+            reason: response?.reason || null,
+            confidence: response?.confidence || null,
+            venue: response?.venue || null,
+            year: response?.year || null,
+            publicationType: response?.publicationType || null
+        };
+
+        if (DEBUG) {
+            console.debug(`[SVR v14] ${resolver} Kandidatenbewertung`, {
+                paper,
+                result: trace[`${resolver}Result`],
+                candidates: summarizeAssessments(response?.assessments)
+            });
+        }
+
+        if (!response?.resolved || !response?.venue) {
+            if (isCacheableResolverMiss(response?.reason)) {
+                await cacheResolverMiss(resolver, paper.title, paper.year);
+            }
+            return null;
+        }
+
+        const resolution = structuredResolution(
+            { venue: response.venue, type: response.publicationType },
+            visibleVenue,
+            paper.title,
+            rankings,
+            resolver
+        );
+
+        if (!resolution) {
+            trace[`${resolver}Result`].reason = "venue-or-type-not-safe";
+            await cacheResolverMiss(resolver, paper.title, paper.year);
+            return null;
+        }
+
+        debugStats[`${resolver}Resolutions`] += 1;
+        await cacheMetadata(paper.title, paper.year, resolution);
+        return resolution;
     }
 
     async function resolveViaScholarCite(pub, title, year, visibleVenue, rankings) {
@@ -1202,6 +1608,7 @@
         }
 
         citeLookupsThisPage += 1;
+        debugStats.citeRequests += 1;
 
         try {
             const doc = await fetchScholarCiteDocument(cid);
@@ -1268,10 +1675,20 @@
         return badge;
     }
 
-    function appendRank(container, system, candidate, color, resolution) {
+    function badgeColorsFor(system, rank) {
+        const normalizedSystem = String(system || "").trim().toUpperCase();
+        const normalizedRank = String(rank || "").trim().toUpperCase();
+        return BADGE_COLORS[normalizedSystem]?.[normalizedRank] || NEUTRAL_BADGE_COLOR;
+    }
+
+    function appendRank(container, system, candidate, resolution) {
         if (!candidate) {
             if (SHOW_NOT_FOUND) {
-                container.appendChild(createBadge(`${system}: 404`, "#e0e0e0", "#555"));
+                container.appendChild(createBadge(
+                    `${system}: 404`,
+                    NEUTRAL_BADGE_COLOR.background,
+                    NEUTRAL_BADGE_COLOR.text
+                ));
             }
             return;
         }
@@ -1280,10 +1697,11 @@
         const rank = rawRank == null ? "" : String(rawRank).trim();
         const lower = rank.toLowerCase();
         const unranked = ["", "unranked", "national", "none", "-"].includes(lower);
+        const colors = badgeColorsFor(system, unranked ? "" : rank);
 
         const badge = unranked
-            ? createBadge(`${system}: -`, "#9e9e9e")
-            : createBadge(`${system}: ${rank}`, color);
+            ? createBadge(`${system}: -`, colors.background, colors.text)
+            : createBadge(`${system}: ${rank}`, colors.background, colors.text);
 
         if (DEBUG) {
             badge.title = [
@@ -1300,8 +1718,13 @@
         container.appendChild(badge);
     }
 
-    function renderRanks(titleElement, resolution, title, rankings) {
-        const existing = titleElement.querySelector(".scholar-ranking-badges");
+    function renderRanks(titleElement, resolution, title, rankings, options = {}) {
+        const pageType = options.pageType || "search";
+        const badgePlacement = options.badgePlacement || "append";
+        const badgeRoot = badgePlacement === "after-title"
+            ? titleElement.parentElement
+            : titleElement;
+        const existing = badgeRoot?.querySelector(".scholar-ranking-badges");
         if (existing) existing.remove();
 
         if (!resolution || resolution.type === "unknown" || resolution.type === "subvenue") return;
@@ -1335,7 +1758,9 @@
                 coreName: candidate.coreName ?? null
             } : null;
 
-            console.debug("[SVR v13.2 MATCH]", {
+            const label = pageType === "profile" ? "[SVR v14 PROFILE MATCH]" : "[SVR v14 MATCH]";
+            console.debug(label, {
+                pageType,
                 title,
                 resolution,
                 summary: {
@@ -1352,81 +1777,388 @@
         container.style.display = "inline-block";
         container.style.marginLeft = "4px";
 
-        appendRank(container, "CORE", core, "#4CAF50", resolution);
-        appendRank(container, "CCF", ccf, "#2196F3", resolution);
-        appendRank(container, "SJR", sjr, "#FF9800", resolution);
+        appendRank(container, "CORE", core, resolution);
+        appendRank(container, "CCF", ccf, resolution);
+        appendRank(container, "SJR", sjr, resolution);
 
-        if (container.hasChildNodes()) titleElement.appendChild(container);
+        if (!container.hasChildNodes()) return;
+        if (badgePlacement === "after-title" && titleElement.insertAdjacentElement) {
+            titleElement.insertAdjacentElement("afterend", container);
+        } else {
+            titleElement.appendChild(container);
+        }
     }
 
     // ------------------------------------------------------------------
     // Hauptablauf
     // ------------------------------------------------------------------
 
-    async function processPublication(pub, rankings) {
-        if (pub.dataset.svrState === "processing" || pub.dataset.svrState === "done") return;
-        pub.dataset.svrState = "processing";
+    function logFinalResolution(context, resolution) {
+        if (!DEBUG) return;
+        console.debug("[SVR v14 RESOLUTION]", {
+            pageType: context.pageType,
+            title: context.title,
+            scholarVenue: context.meta.venue,
+            scholarVenueRaw: context.meta.rawVenue,
+            year: context.meta.year,
+            trace: context.trace,
+            finalResolution: resolution,
+            requestStats: { ...debugStats }
+        });
+    }
 
-        const titleElement = pub.querySelector(".gs_rt");
-        const metaElement = pub.querySelector(".gs_a");
-        if (!titleElement || !metaElement) {
+    function finalizePublication(context, resolution) {
+        if (context.dwellTimer) {
+            clearTimeout(context.dwellTimer);
+            context.dwellTimer = null;
+        }
+        if (citeObserver) citeObserver.unobserve(context.pub);
+        if (profileObserver) profileObserver.unobserve(context.pub);
+        renderRanks(context.titleElement, resolution, context.title, context.rankings, {
+            pageType: context.pageType,
+            badgePlacement: context.badgePlacement
+        });
+        context.pub.dataset.svrState = "done";
+        context.resolution = resolution;
+        logFinalResolution(context, resolution);
+    }
+
+    function enqueueScholarCite(context) {
+        if (context.citeQueued || context.pub.dataset.svrState === "done") return;
+        if (context.pageType === "profile") {
+            context.trace.citeSkipped = "disabled-on-profile";
+            finalizePublication(context, null);
+            return;
+        }
+        if (citeLookupBlocked || citeLookupsThisPage >= MAX_CITE_LOOKUPS_PER_PAGE) {
+            context.trace.citeSkipped = citeLookupBlocked ? "blocked" : "page-limit";
+            if (DEBUG) {
+                console.debug("[SVR v14] Scholar Cite übersprungen", {
+                    title: context.title,
+                    reason: context.trace.citeSkipped,
+                    citeLookupsThisPage
+                });
+            }
+            finalizePublication(context, null);
+            return;
+        }
+
+        context.citeQueued = true;
+        context.pub.dataset.svrState = "cite-queued";
+
+        const run = citeQueueTail.catch(() => undefined).then(async () => {
+            context.citeQueued = false;
+            if (context.pub.dataset.svrState === "done") return;
+
+            // Schnelles Scrollen kann den Eintrag aus dem Viewport entfernen,
+            // während er noch hinter einem anderen Cite-Request wartet.
+            if (!context.visible) {
+                context.pub.dataset.svrState = "waiting-for-cite";
+                return;
+            }
+
+            if (citeLookupBlocked || citeLookupsThisPage >= MAX_CITE_LOOKUPS_PER_PAGE) {
+                context.trace.citeSkipped = citeLookupBlocked ? "blocked" : "page-limit";
+                finalizePublication(context, null);
+                return;
+            }
+
+            context.pub.dataset.svrState = "cite-resolving";
+            context.trace.citeStartedFromViewport = true;
+            const resolution = await resolveViaScholarCite(
+                context.pub,
+                context.title,
+                context.meta.year,
+                context.meta.rawVenue,
+                context.rankings
+            );
+
+            if (resolution) {
+                debugStats.citeResolutions += 1;
+                await cacheMetadata(context.title, context.meta.year, resolution);
+            }
+            finalizePublication(context, resolution);
+        }).catch(error => {
+            context.trace.citeError = String(error?.message || error);
+            finalizePublication(context, null);
+        });
+
+        citeQueueTail = run.catch(() => undefined);
+    }
+
+    function startCiteDwellTimer(context) {
+        if (context.dwellTimer || context.citeQueued || context.pub.dataset.svrState === "done") return;
+        context.dwellTimer = setTimeout(() => {
+            context.dwellTimer = null;
+            if (context.visible && context.pub.dataset.svrState === "waiting-for-cite") {
+                enqueueScholarCite(context);
+            }
+        }, CITE_DWELL_MS);
+    }
+
+    function ensureCiteObserver() {
+        if (citeObserver) return citeObserver;
+        if (typeof IntersectionObserver !== "function") return null;
+
+        citeObserver = new IntersectionObserver(entries => {
+            for (const entry of entries) {
+                const context = citeContexts.get(entry.target);
+                if (!context || entry.target.dataset.svrState === "done") continue;
+
+                context.visible = entry.isIntersecting && entry.intersectionRatio >= 0.25;
+                if (context.visible) {
+                    startCiteDwellTimer(context);
+                } else if (context.dwellTimer) {
+                    clearTimeout(context.dwellTimer);
+                    context.dwellTimer = null;
+                }
+            }
+        }, { threshold: [0.25] });
+
+        return citeObserver;
+    }
+
+    function waitForLazyScholarCite(context) {
+        const observer = ensureCiteObserver();
+        if (!observer || !getScholarCid(context.pub)) {
+            context.trace.citeSkipped = observer ? "cid-missing" : "intersection-observer-unavailable";
+            finalizePublication(context, null);
+            return;
+        }
+
+        context.pub.dataset.svrState = "waiting-for-cite";
+        context.trace.citeNecessary = true;
+        citeContexts.set(context.pub, context);
+        observer.observe(context.pub);
+    }
+
+    async function resolveContextExternally(context) {
+        const paper = {
+            title: context.title,
+            year: context.meta.year,
+            authors: context.meta.authors
+        };
+
+        for (const resolver of EXTERNAL_RESOLVER_ORDER) {
+            const resolution = await resolveViaExternalMetadata(
+                resolver,
+                paper,
+                context.meta.rawVenue,
+                context.rankings,
+                context.trace
+            );
+            if (resolution) return resolution;
+        }
+        return null;
+    }
+
+    async function resolveProfileContext(context) {
+        if (context.pub.dataset.svrState === "done") return;
+        context.pub.dataset.svrState = "profile-resolving";
+        try {
+            const resolution = await resolveContextExternally(context);
+            if (resolution) debugStats.profileExternalResolutions += 1;
+            finalizePublication(context, resolution);
+        } catch (error) {
+            context.trace.pipelineError = String(error?.message || error);
+            finalizePublication(context, null);
+        }
+    }
+
+    function ensureProfileObserver() {
+        if (profileObserver) return profileObserver;
+        if (typeof IntersectionObserver !== "function") return null;
+
+        profileObserver = new IntersectionObserver(entries => {
+            for (const entry of entries) {
+                const context = profileContexts.get(entry.target);
+                if (!context || entry.target.dataset.svrState !== "waiting-for-profile-viewport") continue;
+                if (!entry.isIntersecting) continue;
+
+                profileObserver.unobserve(entry.target);
+                resolveProfileContext(context);
+            }
+        }, {
+            rootMargin: "400px 0px",
+            threshold: [0.01]
+        });
+        return profileObserver;
+    }
+
+    function waitForLazyProfileResolution(context) {
+        const observer = ensureProfileObserver();
+        if (!observer) {
+            context.trace.profileExternalSkipped = "intersection-observer-unavailable";
+            finalizePublication(context, null);
+            return;
+        }
+
+        context.pub.dataset.svrState = "waiting-for-profile-viewport";
+        context.trace.profileWaitingForViewport = true;
+        profileContexts.set(context.pub, context);
+        debugStats.profileRowsObserved += 1;
+        observer.observe(context.pub);
+    }
+
+    async function processPublication(pub, rankings, pageType = "search") {
+        if (pub.dataset.svrState) return;
+        pub.dataset.svrState = "pending";
+        if (pageType === "profile") debugStats.profileRowsDetected += 1;
+
+        const paperMetadata = extractPaperMetadata(pub, pageType);
+        if (!paperMetadata) {
             pub.dataset.svrState = "done";
             return;
         }
 
-        const title = cleanTitle(titleElement.textContent);
-        const meta = extractMeta(metaElement.textContent);
-        if (!title || !meta?.venue) {
-            pub.dataset.svrState = "done";
-            return;
-        }
+        const { titleElement, title, meta, badgePlacement } = paperMetadata;
 
-        let resolution = highConfidenceVisibleResolution(meta, title, rankings);
+        const trace = {
+            pageType,
+            visibleResolved: false,
+            metadataCache: "miss",
+            legacyCiteCache: "miss",
+            dblpLookupStarted: false,
+            crossrefLookupStarted: false,
+            citeNecessary: false,
+            citeStartedFromViewport: false
+        };
+        const context = {
+            pub,
+            pageType,
+            rankings,
+            titleElement,
+            badgePlacement,
+            title,
+            meta,
+            trace,
+            visible: false,
+            dwellTimer: null,
+            citeQueued: false,
+            resolution: null
+        };
 
-        if (!resolution && !detectSubvenue(title, meta.rawVenue)) {
-            resolution = await resolveViaScholarCite(pub, title, meta.year, meta.rawVenue, rankings);
-        }
+        try {
+            pub.dataset.svrState = "resolving";
+            let resolution = highConfidenceVisibleResolution(meta, title, rankings);
+            if (resolution) {
+                trace.visibleResolved = true;
+                debugStats.visibleResolutions += 1;
+                finalizePublication(context, resolution);
+                return;
+            }
 
-        if (!resolution && detectSubvenue(title, meta.rawVenue)) {
-            resolution = {
-                type: "subvenue",
-                venue: meta.venue,
-                source: "scholar-visible",
-                variants: []
-            };
-        }
+            resolution = await getCachedMetadata(title, meta.year);
+            if (resolution) {
+                trace.metadataCache = "hit";
+                debugStats.metadataCacheHits += 1;
+                finalizePublication(context, resolution);
+                return;
+            }
 
-        renderRanks(titleElement, resolution, title, rankings);
-        pub.dataset.svrState = "done";
+            if (pageType === "profile") {
+                waitForLazyProfileResolution(context);
+                return;
+            }
 
-        if (DEBUG) {
-            console.debug("[Scholar Venue Ranker]", {
-                title,
-                year: meta.year,
-                scholarVenue: meta.venue,
-                scholarVenueRaw: meta.rawVenue,
-                truncated: meta.truncated,
-                resolution
-            });
+            // Der vorhandene CID-Cache zählt als lokaler Metadata-Cache und wird
+            // vor externen APIs geprüft, damit alte Treffer keine neuen Requests
+            // verursachen. Sein Prefix bleibt bewusst unverändert.
+            const cid = getScholarCid(pub);
+            resolution = await getCachedCitation(cid, title, meta.year);
+            if (resolution) {
+                trace.legacyCiteCache = "hit";
+                debugStats.metadataCacheHits += 1;
+                await cacheMetadata(title, meta.year, resolution);
+                finalizePublication(context, resolution);
+                return;
+            }
+
+            resolution = await resolveContextExternally(context);
+
+            if (resolution) {
+                finalizePublication(context, resolution);
+                return;
+            }
+
+            waitForLazyScholarCite(context);
+        } catch (error) {
+            trace.pipelineError = String(error?.message || error);
+            finalizePublication(context, null);
         }
     }
 
-    async function processResults(rankings) {
-        const publications = [...document.querySelectorAll(".gs_r.gs_or.gs_scl")];
-        // Absichtlich sequenziell: weniger Scholar-Requests gleichzeitig und
-        // deterministische Zuordnung von Resultat -> Cite-Antwort.
-        for (const pub of publications) {
-            await processPublication(pub, rankings);
+    async function processResults(rankings, pageType = "search") {
+        const publications = [...document.querySelectorAll(publicationSelector(pageType))];
+        let nextIndex = 0;
+
+        async function worker() {
+            while (nextIndex < publications.length) {
+                const pub = publications[nextIndex];
+                nextIndex += 1;
+                await processPublication(pub, rankings, pageType);
+            }
         }
+
+        const workerCount = Math.min(RESULT_WORKER_COUNT, publications.length);
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
     }
 
-    // Kleine, explizit aktivierte Testoberfläche; im Content Script bleibt sie
-    // standardmäßig vollständig inaktiv.
+    function observeDynamicResults(rankings, pageType = "search") {
+        if (typeof MutationObserver !== "function") return;
+        const rowSelector = pageType === "profile" ? ".gsc_a_tr" : ".gs_r.gs_or.gs_scl";
+        const observer = new MutationObserver(mutations => {
+            const publications = new Set();
+            for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                    if (!(node instanceof Element)) continue;
+                    if (node.matches(rowSelector)) publications.add(node);
+                    for (const pub of node.querySelectorAll(rowSelector)) publications.add(pub);
+                }
+            }
+            for (const pub of publications) processPublication(pub, rankings, pageType);
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
     if (globalThis.__SVR_ENABLE_TEST_HOOKS__) {
         globalThis.__SVR_TEST_HOOKS__ = {
-            detectSubvenue,
+            appendRank,
+            badgeColorsFor,
+            bestCatalogMatch,
             cacheCitation,
-            maintainCitationCache
+            cacheMetadata,
+            debugStats,
+            detectPageType,
+            detectSubvenue,
+            evaluateRankingItem,
+            extractMeta,
+            extractPaperMetadata,
+            extractProfilePaper,
+            getCachedMetadata,
+            hasCachedResolverMiss,
+            maintainLocalCaches,
+            metadataCacheKey,
+            metadataIdentity,
+            metadataMissKey,
+            normalize,
+            observeDynamicResults,
+            prepareItem,
+            processPublication,
+            processResults,
+            renderRanks,
+            isCacheableResolverMiss,
+            shortAcronymWithCoreSupport,
+            structuredResolution,
+            config: {
+                citeCachePrefix: CITE_CACHE_PREFIX,
+                citeDelayMs: CITE_DELAY_MS,
+                citeDwellMs: CITE_DWELL_MS,
+                maxCiteLookupsPerPage: MAX_CITE_LOOKUPS_PER_PAGE,
+                metadataCacheTtlMs: METADATA_CACHE_TTL_MS,
+                metadataMissTtlMs: METADATA_MISS_TTL_MS,
+                resolverOrder: [...EXTERNAL_RESOLVER_ORDER]
+            }
         };
     }
 })();

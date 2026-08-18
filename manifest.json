@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Scholar Venue Ranker",
-  "version": "1.2",
+  "version": "1.4",
   "description": "Zeigt Konferenz- und Journal-Rankings für Computer-Science-Paper in Google Scholar an.",
   "permissions": [
     "storage",
@@ -9,6 +9,8 @@
   ],
   "host_permissions": [
     "https://raw.githubusercontent.com/*",
+    "https://dblp.org/*",
+    "https://api.crossref.org/*",
     "https://scholar.google.com/*",
     "https://scholar.google.de/*"
   ],
