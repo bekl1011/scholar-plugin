@@ -221,21 +221,21 @@ test("ranking systems and ranks map to the exact central badge palette", () => {
     const { hooks } = loadContentHooks();
     const expected = {
         CORE: {
-            "A*": { background: "#B7E4C7", text: "#12351F" },
-            A: { background: "#2D6A4F", text: "#FFFFFF" },
+            "A*": { background: "#2D6A4F", text: "#FFFFFF" },
+            A: { background: "#B7E4C7", text: "#12351F" },
             B: { background: "#F4D35E", text: "#3B2F00" },
             C: { background: "#B23A48", text: "#FFFFFF" }
         },
         CCF: {
-            A: { background: "#0277BD", text: "#FFFFFF" },
-            B: { background: "#4D91C6", text: "#FFFFFF" },
-            C: { background: "#A5C7DF", text: "#173047" }
+            A: { background: "#0057B8", text: "#FFFFFF" },
+            B: { background: "#5AA6E0", text: "#0B2239" },
+            C: { background: "#B9DCF5", text: "#12324A" }
         },
         SJR: {
-            Q1: { background: "#7B1FA2", text: "#FFFFFF" },
-            Q2: { background: "#8E5AA8", text: "#FFFFFF" },
-            Q3: { background: "#B18ABC", text: "#2E1834" },
-            Q4: { background: "#C7B8CC", text: "#332B35" }
+            Q1: { background: "#5B148C", text: "#FFFFFF" },
+            Q2: { background: "#9146B8", text: "#FFFFFF" },
+            Q3: { background: "#C68AD9", text: "#2B1833" },
+            Q4: { background: "#E4D8E8", text: "#3A2C40" }
         }
     };
 
@@ -304,8 +304,8 @@ test("search and profile rendering use identical badge colors", () => {
         badgeStyles(profileCell.badge)
     );
     assert.deepEqual(badgeStyles(profileCell.badge), [
-        { text: "[CORE: A*]", background: "#B7E4C7", color: "#12351F" },
-        { text: "[CCF: A]", background: "#0277BD", color: "#FFFFFF" }
+        { text: "[CORE: A*]", background: "#2D6A4F", color: "#FFFFFF" },
+        { text: "[CCF: A]", background: "#0057B8", color: "#FFFFFF" }
     ]);
 });
 
@@ -428,7 +428,7 @@ test("negative metadata cache is source-specific", async () => {
 test("Scholar Cite is configured as a slow, viewport-gated last fallback", () => {
     const { hooks } = loadContentHooks();
     assert.equal(hooks.config.resolverOrder.join(","), "dblp,crossref");
-    assert.equal(hooks.config.citeCachePrefix, "scholarCite:v13-debug:");
+    assert.equal(hooks.config.citeCachePrefix, "scholarCite:v14:");
     assert.equal(hooks.config.maxCiteLookupsPerPage, 2);
     assert.equal(hooks.config.citeDwellMs, 1500);
     assert.equal(hooks.config.citeDelayMs, 4000);
@@ -481,6 +481,93 @@ test("adversarial acronym matcher regressions remain rejected", () => {
             "§ 13. Das Reich unter Kaiser Leopold I."
         ),
         null
+    );
+});
+
+test("truncated organization names cannot create a canonical venue identity", () => {
+    const { hooks } = loadContentHooks();
+    const ieeeCatalog = [
+        hooks.prepareItem({ name: "Proceedings of the IEEE", abbr: "Proc. IEEE", rank: "A" }, "journal", "CCF"),
+        hooks.prepareItem({ name: "IEEE Access", abbr: "IEEE Access", rank: "Q1" }, "journal", "SJR"),
+        hooks.prepareItem({ name: "IEEE Transactions on Networking", abbr: "TON", rank: "A" }, "journal", "CCF")
+    ];
+    const acmCatalog = [
+        hooks.prepareItem({ name: "Proceedings of the ACM", abbr: "Proc. ACM", rank: "A" }, "journal", "TEST"),
+        hooks.prepareItem({ name: "ACM Computing Surveys", abbr: "CSUR", rank: "A" }, "journal", "TEST"),
+        hooks.prepareItem({ name: "ACM SIGCOMM Conference", abbr: "SIGCOMM", rank: "A" }, "conference", "TEST")
+    ];
+
+    assert.equal(
+        hooks.bestCatalogMatch(ieeeCatalog, [{ value: "IEEE …, 2025", origin: "visible" }], "TEST"),
+        null
+    );
+    assert.equal(
+        hooks.bestCatalogMatch(acmCatalog, [{ value: "ACM …, 2025", origin: "visible" }], "TEST"),
+        null
+    );
+});
+
+test("IEEE Access does not match Proceedings of the IEEE", () => {
+    const { hooks } = loadContentHooks();
+    const proceedings = hooks.prepareItem(
+        { name: "Proceedings of the IEEE", abbr: "Proc. IEEE", rank: "A" },
+        "journal",
+        "CCF"
+    );
+
+    assert.equal(
+        hooks.bestCatalogMatch([proceedings], [{ value: "IEEE Access", origin: "crossref" }], "CCF"),
+        null
+    );
+});
+
+test("the full Proceedings of the IEEE name retains its exact-name match", () => {
+    const { hooks } = loadContentHooks();
+    const proceedings = hooks.prepareItem(
+        { name: "Proceedings of the IEEE", abbr: "Proc. IEEE", rank: "A" },
+        "journal",
+        "CCF"
+    );
+    const match = hooks.bestCatalogMatch(
+        [proceedings],
+        [{ value: "Proceedings of the IEEE", origin: "crossref" }],
+        "CCF"
+    );
+
+    assert.ok(match);
+    assert.equal(match.matchedBy, "exact-name");
+    assert.equal(match.item.rank, "A");
+});
+
+test("IEEE Access with a truncated visible variant renders SJR only", () => {
+    const { hooks } = profileTestEnvironment();
+    const rankings = {
+        core: [],
+        ccfConferences: [],
+        ccfJournals: [
+            hooks.prepareItem({ name: "Proceedings of the IEEE", abbr: "Proc. IEEE", rank: "A" }, "journal", "CCF")
+        ],
+        sjr: [
+            hooks.prepareItem({ name: "IEEE Access", abbr: "IEEE Access", rank: "Q1" }, "journal", "SJR")
+        ]
+    };
+    const titleElement = new FakeElement(
+        "Network digital twin toward networking, telecommunications, and traffic engineering: A survey"
+    );
+
+    hooks.renderRanks(titleElement, {
+        venue: "IEEE Access",
+        type: "journal",
+        source: "crossref",
+        variants: [
+            { value: "IEEE …, 2025", origin: "visible" },
+            { value: "IEEE Access", origin: "crossref" }
+        ]
+    }, titleElement.textContent, rankings);
+
+    assert.deepEqual(
+        titleElement.children[0].children.map(child => child.textContent),
+        ["[SJR: Q1]"]
     );
 });
 

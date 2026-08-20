@@ -2,7 +2,7 @@
     "use strict";
 
     const SHOW_NOT_FOUND = false;
-    const DEBUG = false;
+    const DEBUG = true;
 
     const CITE_CACHE_ROOT_PREFIX = "scholarCite:";
     const CITE_CACHE_PREFIX = "scholarCite:v14:";
@@ -942,7 +942,17 @@
                 consider({ item, score: 1390, matchedBy: "exact-abbr", venue: value, origin });
                 continue;
             }
-            if (item._canonical && canonical === item._canonical) {
+            // canonicalVenue() entfernt u.a. "Proceedings of ...". Wenn danach
+            // nur ein Organisations-/Publisher-Token übrig bleibt (z.B. IEEE
+            // oder ACM), ist die Gleichheit keine belastbare Venue-Identität.
+            // Vollständige Namen bleiben über den vorherigen exact-name-Pfad
+            // unverändert matchbar.
+            if (
+                item._canonical &&
+                canonical === item._canonical &&
+                item._coreName &&
+                coreName
+            ) {
                 consider({ item, score: 1370, matchedBy: "canonical-name", venue: value, origin });
                 continue;
             }
