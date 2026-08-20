@@ -458,6 +458,24 @@ test("adversarial acronym matcher regressions remain rejected", () => {
     assert.equal(
         catalogMatch(
             hooks,
+            "International Conference on Service Oriented Computing",
+            "ICSOC",
+            "European Conference on Service-Oriented and Cloud Computing"
+        ),
+        null
+    );
+    assert.equal(
+        catalogMatch(
+            hooks,
+            "IEEE International Conference on Cloud Computing",
+            "CLOUD",
+            "European Conference on Service-Oriented and Cloud Computing"
+        ),
+        null
+    );
+    assert.equal(
+        catalogMatch(
+            hooks,
             "International Conference on Machine Learning",
             "ICML",
             "2024 IEEE International Conference on Machine Learning for Communication and Networking (ICMLCN)"
@@ -482,6 +500,39 @@ test("adversarial acronym matcher regressions remain rejected", () => {
         ),
         null
     );
+});
+
+test("bidirectional token coverage retains equivalent venue identities", () => {
+    const { hooks } = loadContentHooks();
+    const match = catalogMatch(
+        hooks,
+        "International Conference on Distributed Systems",
+        "",
+        "Conference on Distributed Systems"
+    );
+
+    assert.ok(match);
+    assert.equal(match.matchedBy, "identity-token-match");
+    assert.equal(match.tokenStats.catalogCoverage, 1);
+    assert.equal(match.tokenStats.venueCoverage, 1);
+});
+
+test("genuine acronym-form occurrences retain strong standalone matching", () => {
+    const { hooks } = loadContentHooks();
+    const cases = [
+        ["IEEE International Conference on Computer Communications", "INFOCOM", "Proceedings of IEEE INFOCOM 2025"],
+        ["ACM SIGCOMM Conference", "SIGCOMM", "Proceedings of ACM SIGCOMM 2025"],
+        ["ACM International Conference on Mobile Systems, Applications, and Services", "MobiSys", "Proceedings of MobiSys 2025"],
+        ["International Conference on Trust, Security and Privacy in Computing and Communications", "TrustCom", "Proceedings of TrustCom 2025"],
+        ["Network and Distributed System Security Symposium", "NDSS", "Network Security Symposium (NDSS) 2025"],
+        ["IEEE International Conference on Cloud Computing", "CLOUD", "Proceedings of IEEE CLOUD 2025"]
+    ];
+
+    for (const [name, abbr, venue] of cases) {
+        const match = catalogMatch(hooks, name, abbr, venue);
+        assert.ok(match, `${abbr} should retain acronym-form matching`);
+        assert.match(match.matchedBy, /acronym/);
+    }
 });
 
 test("truncated organization names cannot create a canonical venue identity", () => {

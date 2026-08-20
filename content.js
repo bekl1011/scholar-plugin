@@ -386,13 +386,21 @@
     }
 
     function tokenStats(a, b) {
-        if (!a.size || !b.size) return { intersection: 0, coverage: 0, jaccard: 0 };
+        if (!a.size || !b.size) {
+            return {
+                intersection: 0,
+                catalogCoverage: 0,
+                venueCoverage: 0,
+                jaccard: 0
+            };
+        }
         let intersection = 0;
         for (const token of a) if (b.has(token)) intersection += 1;
         const union = a.size + b.size - intersection;
         return {
             intersection,
-            coverage: intersection / a.size,
+            catalogCoverage: intersection / a.size,
+            venueCoverage: intersection / b.size,
             jaccard: union ? intersection / union : 0
         };
     }
@@ -664,7 +672,13 @@
             .split(/[^A-Za-z0-9*+]+/)
             .filter(Boolean);
 
-        const index = tokens.findIndex(token => token.toLowerCase() === part.toLowerCase());
+        // Nicht nur das Katalogkürzel, sondern auch sein konkretes Vorkommen
+        // muss wie ein Akronym geschrieben sein. Dadurch ist "CLOUD" in
+        // "... and Cloud Computing" ein normales Wort, während INFOCOM,
+        // SIGCOMM, MobiSys oder TrustCom weiterhin starke Evidenz liefern.
+        const index = tokens.findIndex(token =>
+            token.toLowerCase() === part.toLowerCase() && isAcronymLikeToken(token)
+        );
         if (index < 0) return null;
 
         return {
@@ -1031,18 +1045,23 @@
             // Organisations-/Serientokens bleiben erhalten (IFIP Networking),
             // generische Wörter wie "conference" werden entfernt.
             //
-            // Wichtig: Wir verlangen sowohl hohe Abdeckung des Katalognamens
-            // ALS AUCH eine hohe Jaccard-Ähnlichkeit. Dadurch gilt:
+            // Wichtig: Wir verlangen hohe Abdeckung in BEIDEN Richtungen und
+            // zusätzlich eine hohe Jaccard-Ähnlichkeit. Ein allgemeinerer
+            // Katalogname darf dadurch keine spezifischere Venue mit weiteren
+            // Identitätstokens übernehmen. Dadurch gilt:
             //   ICMLCN enthält "Machine Learning", ist aber NICHT ICML.
+            //   ICSOC enthält "Service Oriented Computing", ist aber NICHT
+            //   "Service-Oriented and Cloud Computing".
             //   IFIP Networking 2026 IST IFIP Conference on Networking.
             const stats = tokenStats(item._identityTokens, identityTokens);
             if (
                 item._identityTokens.size >= 2 &&
                 stats.intersection >= 2 &&
-                stats.coverage >= 0.85 &&
+                stats.catalogCoverage >= 0.85 &&
+                stats.venueCoverage >= 0.85 &&
                 stats.jaccard >= 0.60
             ) {
-                const score = 1240 + Math.round(stats.coverage * 40 + stats.jaccard * 40);
+                const score = 1240 + Math.round(stats.catalogCoverage * 40 + stats.jaccard * 40);
                 consider({
                     item,
                     score,
